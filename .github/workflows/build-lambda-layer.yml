@@ -6,21 +6,46 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Deployment environment (prod or test)'
+      aws_account_id:
+        description: 'AWS account ID where the layer will be published'
         required: true
-        default: 'test'
-      stack_version:
-        description: 'IaC branch/tag to update (ignored in prod)'
+      aws_region:
+        description: 'AWS region'
         required: false
-        default: 'test'
+        default: 'us-east-1'
+      runner_project:
+        description: 'CodeBuild runner project name (e.g. codebuild-my-org-runner)'
+        required: true
+      layer_name:
+        description: 'Lambda layer name'
+        required: false
+        default: 'kalbio'
+      organization_id:
+        description: 'AWS org ID for layer permission (optional; omit to skip org-wide grant)'
+        required: false
+      iac_repository:
+        description: 'IaC repo to update with layer version (owner/repo; omit to skip)'
+        required: false
+      iac_ref:
+        description: 'IaC branch/tag to update'
+        required: false
+        default: 'main'
+      iac_config_path:
+        description: 'Path within IaC repo to config file directory, e.g., src/cdk'
+        required: false
+        default: ''
+      iac_config_file:
+        description: 'Config filename to update (within iac_config_path,) e.g., myconf.yml'
+        required: false
+        default: ''
 
 jobs:
   build-and-deploy:
-    runs-on: ${{ inputs.environment == 'prod' && format('codebuild-dataeng-prod-actions-runner-{0}-{1}', github.run_id, github.run_attempt) || format('codebuild-dataeng-test-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    runs-on: ${{ format('{0}-{1}-{2}', inputs.runner_project, github.run_id, github.run_attempt) }}
     env:
-      AWS_ACCOUNT: ${{ inputs.environment == 'prod' && '304445033218' || '115906535831' }}
-      STACK_VERSION: ${{ inputs.environment == 'prod' && 'main' || inputs.stack_version }}
+      AWS_ACCOUNT: ${{ inputs.aws_account_id }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      LAYER_NAME: ${{ inputs.layer_name }}
     outputs:
       VERSION: ${{ steps.deploy.outputs.VERSION }}
     steps:
@@ -49,37 +74,46 @@ jobs:
         id: deploy
         run: |
           cd aws-layer
-          PUBLISH=$(aws lambda publish-layer-version --layer-name kalbio --zip-file fileb://lambda-layer.zip --compatible-runtimes python3.10)
+          PUBLISH=$(aws lambda publish-layer-version --layer-name ${{ env.LAYER_NAME }} --zip-file fileb://lambda-layer.zip --compatible-runtimes python3.10 --region ${{ env.AWS_REGION }})
           VERSION=$(echo $PUBLISH|jq -r .Version)
-          aws lambda add-layer-version-permission --layer-name kalbio --version-number ${VERSION} --statement-id allOrganizationAccounts --principal "*" --organization-id o-2r45zcwsq5 --action lambda:GetLayerVersion
+          if [ -n "${{ inputs.organization_id }}" ]; then
+            aws lambda add-layer-version-permission --layer-name ${{ env.LAYER_NAME }} --version-number ${VERSION} --statement-id allOrganizationAccounts --principal "*" --organization-id ${{ inputs.organization_id }} --action lambda:GetLayerVersion --region ${{ env.AWS_REGION }}
+          fi
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
 
   update-iac:
-    runs-on: ${{ inputs.environment == 'prod' && format('codebuild-dataeng-prod-actions-runner-{0}-{1}', github.run_id, github.run_attempt) || format('codebuild-dataeng-test-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    if: ${{ inputs.iac_repository != '' }}
+    runs-on: ${{ format('{0}-{1}-{2}', inputs.runner_project, github.run_id, github.run_attempt) }}
     needs: [build-and-deploy]
     permissions:
       contents: write
     env:
-      AWS_ACCOUNT: ${{ inputs.environment == 'prod' && '304445033218' || '115906535831' }}
-      STACK_VERSION: ${{ inputs.environment == 'prod' && 'main' || inputs.stack_version }}
+      AWS_ACCOUNT: ${{ inputs.aws_account_id }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      LAYER_NAME: ${{ inputs.layer_name }}
     steps:
       - name: Checkout IaC
         uses: actions/checkout@v4
         with:
-          repository: FogPharma/IaC-DataScience
-          path: IaC-DataScience
-          ref: ${{ env.STACK_VERSION }}
+          repository: ${{ inputs.iac_repository }}
+          path: iac-repo
+          ref: ${{ inputs.iac_ref }}
           token: ${{ secrets.GH_PAT }}
 
       - name: Update IaC
         run: |
-          cd IaC-DataScience/src/cdk/data-science
-          echo "setting layer arn to arn:aws:lambda:us-east-1:${{ env.AWS_ACCOUNT }}:layer:kalbio"
-          sed -i "s/arn\:aws\:lambda\:us-east-1\:[[:digit:]]\+\:layer\:kalbio/arn\:aws\:lambda\:us-east-1\:${{ env.AWS_ACCOUNT }}\:layer\:kalbio/" data-science-conf.yml
-          echo "setting layer version to kalbio:${{ needs.build-and-deploy.outputs.VERSION }}"
-          sed -i "s/kalbio\:[[:digit:]]\+/kalbio\:${{ needs.build-and-deploy.outputs.VERSION }}/g" data-science-conf.yml
+          cd iac-repo/${{ inputs.iac_config_path }}
+          CONFIG_FILE="${{ inputs.iac_config_file }}"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Config file $CONFIG_FILE not found in ${{ inputs.iac_config_path }}"
+            exit 1
+          fi
+          echo "Setting layer arn to arn:aws:lambda:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT }}:layer:${{ env.LAYER_NAME }}"
+          sed -i "s/arn:aws:lambda:${{ env.AWS_REGION }}:[[:digit:]]*:layer:${{ env.LAYER_NAME }}/arn:aws:lambda:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT }}:layer:${{ env.LAYER_NAME }}/" "$CONFIG_FILE"
+          echo "Setting layer version to ${{ env.LAYER_NAME }}:${{ needs.build-and-deploy.outputs.VERSION }}"
+          sed -i "s/${{ env.LAYER_NAME }}:[[:digit:]]*/${{ env.LAYER_NAME }}:${{ needs.build-and-deploy.outputs.VERSION }}/g" "$CONFIG_FILE"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
-          git add data-science-conf.yml
-          git diff --staged --quiet || git commit -m "bump kalbio layer version to ${{ needs.build-and-deploy.outputs.VERSION }} and account to ${{ env.AWS_ACCOUNT }}"
-          git push origin ${{ env.STACK_VERSION }}
+          git add "$CONFIG_FILE"
+          git diff --staged --quiet || git commit -m "bump ${{ env.LAYER_NAME }} layer version to ${{ needs.build-and-deploy.outputs.VERSION }} and account to ${{ env.AWS_ACCOUNT }}"
+          git push origin ${{ inputs.iac_ref }}
