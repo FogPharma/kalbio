@@ -1,63 +1,110 @@
+# Build and deploy the kalbio Lambda layer.
+#
+# Client setup (GitHub runner):
+#   - OIDC (recommended): Configure GitHub OIDC with AWS, add AWS_ROLE_ARN secret
+#   - Access keys: Add AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets
+#
+# CodeBuild runner: Use runner_type=codebuild and provide runner_project; runner must have pyenv and AWS credentials.
 name: Build and Deploy Lambda Layer
 
 permissions:
-  contents: read
+  contents: read   # Checkout this repo
+  id-token: write  # Required for OIDC when aws_auth_method=oidc
 
 on:
   workflow_dispatch:
     inputs:
+      # Target AWS account for the published layer; must have Lambda publish permissions.
       aws_account_id:
         description: 'AWS account ID where the layer will be published'
         required: true
+      # Region for Lambda layer publish and permissions; us-east-1 is typical.
       aws_region:
         description: 'AWS region'
         required: false
         default: 'us-east-1'
+      # github = GitHub-hosted ubuntu runner; codebuild = self-hosted CodeBuild runner.
+      runner_type:
+        description: 'Runner to use: github (hosted) or codebuild (self-hosted)'
+        required: false
+        default: 'github'
+        type: choice
+        options:
+          - github
+          - codebuild
+      # CodeBuild project label; only used when runner_type=codebuild. Format: codebuild-<project>-{run_id}-{attempt}.
       runner_project:
-        description: 'CodeBuild runner project name (e.g. codebuild-my-org-runner)'
-        required: true
+        description: 'CodeBuild runner project name (required when runner_type=codebuild; e.g. codebuild-my-org-runner)'
+        required: false
+      # Name of the Lambda layer in AWS; used for publish and permission statements.
       layer_name:
         description: 'Lambda layer name'
         required: false
         default: 'kalbio'
+      # If set, grants org-wide GetLayerVersion to all accounts in this AWS organization.
       organization_id:
         description: 'AWS org ID for layer permission (optional; omit to skip org-wide grant)'
         required: false
-      iac_repository:
-        description: 'IaC repo to update with layer version (owner/repo; omit to skip)'
+      # How to authenticate to AWS when using GitHub runner: OIDC (no long-lived secrets) or access keys.
+      aws_auth_method:
+        description: 'AWS auth for GitHub runner: oidc (recommended) or access-key'
         required: false
-      iac_ref:
-        description: 'IaC branch/tag to update'
-        required: false
-        default: 'main'
-      iac_config_path:
-        description: 'Path within IaC repo to config file directory, e.g., src/cdk'
-        required: false
-        default: ''
-      iac_config_file:
-        description: 'Config filename to update (within iac_config_path,) e.g., myconf.yml'
-        required: false
-        default: ''
+        default: 'oidc'
+        type: choice
+        options:
+          - oidc
+          - access-key
 
 jobs:
+  # Builds the kalbio package into a Lambda layer zip, publishes it to AWS, and optionally grants org-wide access.
   build-and-deploy:
-    runs-on: ${{ format('{0}-{1}-{2}', inputs.runner_project, github.run_id, github.run_attempt) }}
+    runs-on: ${{ inputs.runner_type == 'github' && 'ubuntu-latest' || format('{0}-{1}-{2}', inputs.runner_project, github.run_id, github.run_attempt) }}
     env:
+      # Exposed for deploy step and any downstream jobs.
       AWS_ACCOUNT: ${{ inputs.aws_account_id }}
       AWS_REGION: ${{ inputs.aws_region }}
       LAYER_NAME: ${{ inputs.layer_name }}
     outputs:
+      # Published layer version number (e.g. 42) for reference or downstream workflows.
       VERSION: ${{ steps.deploy.outputs.VERSION }}
     steps:
+      # Fetch this repo so pip can install the kalbio package from the workspace.
       - name: Checkout kalbio
         uses: actions/checkout@v4
 
-      - name: Install Python
+      # Assume an IAM role via GitHub OIDC; requires AWS_ROLE_ARN secret and id-token: write permission.
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.runner_type == 'github' && inputs.aws_auth_method == 'oidc'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # Use IAM user access keys; requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY secrets.
+      - name: Configure AWS credentials (access keys)
+        if: inputs.runner_type == 'github' && inputs.aws_auth_method == 'access-key'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # Use setup-python for GitHub-hosted runners; Python 3.10 matches Lambda runtime.
+      - name: Install Python (GitHub runner)
+        if: inputs.runner_type == 'github'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # CodeBuild runners typically use pyenv; 3.10.14 matches Lambda python3.10 runtime.
+      - name: Install Python (CodeBuild runner)
+        if: inputs.runner_type == 'codebuild'
         run: |
           pyenv versions
           pyenv global 3.10.14
           python --version
 
+      # Install kalbio into Lambda layer layout; strip boto/urllib3 (provided by Lambda); remove tests and __pycache__; zip.
       - name: Build Lambda Layer
         run: |
           mkdir -p aws-layer/python/lib/python3.10/site-packages
@@ -70,6 +117,7 @@ jobs:
           zip -q -r9 lambda-layer.zip .
           unzip -l lambda-layer.zip
 
+      # Publish the zip as a new layer version; optionally add org-wide permission for GetLayerVersion.
       - name: Deploy Lambda Layer and Grant permissions
         id: deploy
         run: |
@@ -80,40 +128,3 @@ jobs:
             aws lambda add-layer-version-permission --layer-name ${{ env.LAYER_NAME }} --version-number ${VERSION} --statement-id allOrganizationAccounts --principal "*" --organization-id ${{ inputs.organization_id }} --action lambda:GetLayerVersion --region ${{ env.AWS_REGION }}
           fi
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-
-  update-iac:
-    if: ${{ inputs.iac_repository != '' }}
-    runs-on: ${{ format('{0}-{1}-{2}', inputs.runner_project, github.run_id, github.run_attempt) }}
-    needs: [build-and-deploy]
-    permissions:
-      contents: write
-    env:
-      AWS_ACCOUNT: ${{ inputs.aws_account_id }}
-      AWS_REGION: ${{ inputs.aws_region }}
-      LAYER_NAME: ${{ inputs.layer_name }}
-    steps:
-      - name: Checkout IaC
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.iac_repository }}
-          path: iac-repo
-          ref: ${{ inputs.iac_ref }}
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Update IaC
-        run: |
-          cd iac-repo/${{ inputs.iac_config_path }}
-          CONFIG_FILE="${{ inputs.iac_config_file }}"
-          if [ ! -f "$CONFIG_FILE" ]; then
-            echo "Config file $CONFIG_FILE not found in ${{ inputs.iac_config_path }}"
-            exit 1
-          fi
-          echo "Setting layer arn to arn:aws:lambda:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT }}:layer:${{ env.LAYER_NAME }}"
-          sed -i "s/arn:aws:lambda:${{ env.AWS_REGION }}:[[:digit:]]*:layer:${{ env.LAYER_NAME }}/arn:aws:lambda:${{ env.AWS_REGION }}:${{ env.AWS_ACCOUNT }}:layer:${{ env.LAYER_NAME }}/" "$CONFIG_FILE"
-          echo "Setting layer version to ${{ env.LAYER_NAME }}:${{ needs.build-and-deploy.outputs.VERSION }}"
-          sed -i "s/${{ env.LAYER_NAME }}:[[:digit:]]*/${{ env.LAYER_NAME }}:${{ needs.build-and-deploy.outputs.VERSION }}/g" "$CONFIG_FILE"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git add "$CONFIG_FILE"
-          git diff --staged --quiet || git commit -m "bump ${{ env.LAYER_NAME }} layer version to ${{ needs.build-and-deploy.outputs.VERSION }} and account to ${{ env.AWS_ACCOUNT }}"
-          git push origin ${{ inputs.iac_ref }}
