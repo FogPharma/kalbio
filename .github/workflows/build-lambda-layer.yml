@@ -1,0 +1,85 @@
+name: Build and Deploy Lambda Layer
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment (prod or test)'
+        required: true
+        default: 'test'
+      stack_version:
+        description: 'IaC branch/tag to update (ignored in prod)'
+        required: false
+        default: 'test'
+
+jobs:
+  build-and-deploy:
+    runs-on: ${{ inputs.environment == 'prod' && format('codebuild-dataeng-prod-actions-runner-{0}-{1}', github.run_id, github.run_attempt) || format('codebuild-dataeng-test-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    env:
+      AWS_ACCOUNT: ${{ inputs.environment == 'prod' && '304445033218' || '115906535831' }}
+      STACK_VERSION: ${{ inputs.environment == 'prod' && 'main' || inputs.stack_version }}
+    outputs:
+      VERSION: ${{ steps.deploy.outputs.VERSION }}
+    steps:
+      - name: Checkout kalbio
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        run: |
+          pyenv versions
+          pyenv global 3.10.14
+          python --version
+
+      - name: Build Lambda Layer
+        run: |
+          mkdir -p aws-layer/python/lib/python3.10/site-packages
+          python -m pip install . -q --upgrade --target aws-layer/python/lib/python3.10/site-packages/ --platform manylinux2014_x86_64 --implementation cp --python-version 3.10
+          cd aws-layer
+          rm -rf python/lib/python3.10/site-packages/boto*
+          rm -rf python/lib/python3.10/site-packages/urllib3*
+          find . -type d -name "__pycache__" | xargs rm -rf
+          find . -type d -name "test*" | xargs rm -rf
+          zip -q -r9 lambda-layer.zip .
+          unzip -l lambda-layer.zip
+
+      - name: Deploy Lambda Layer and Grant permissions
+        id: deploy
+        run: |
+          cd aws-layer
+          PUBLISH=$(aws lambda publish-layer-version --layer-name kalbio --zip-file fileb://lambda-layer.zip --compatible-runtimes python3.10)
+          VERSION=$(echo $PUBLISH|jq -r .Version)
+          aws lambda add-layer-version-permission --layer-name kalbio --version-number ${VERSION} --statement-id allOrganizationAccounts --principal "*" --organization-id o-2r45zcwsq5 --action lambda:GetLayerVersion
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+  update-iac:
+    runs-on: ${{ inputs.environment == 'prod' && format('codebuild-dataeng-prod-actions-runner-{0}-{1}', github.run_id, github.run_attempt) || format('codebuild-dataeng-test-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    needs: [build-and-deploy]
+    permissions:
+      contents: write
+    env:
+      AWS_ACCOUNT: ${{ inputs.environment == 'prod' && '304445033218' || '115906535831' }}
+      STACK_VERSION: ${{ inputs.environment == 'prod' && 'main' || inputs.stack_version }}
+    steps:
+      - name: Checkout IaC
+        uses: actions/checkout@v4
+        with:
+          repository: FogPharma/IaC-DataScience
+          path: IaC-DataScience
+          ref: ${{ env.STACK_VERSION }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Update IaC
+        run: |
+          cd IaC-DataScience/src/cdk/data-science
+          echo "setting layer arn to arn:aws:lambda:us-east-1:${{ env.AWS_ACCOUNT }}:layer:kalbio"
+          sed -i "s/arn\:aws\:lambda\:us-east-1\:[[:digit:]]\+\:layer\:kalbio/arn\:aws\:lambda\:us-east-1\:${{ env.AWS_ACCOUNT }}\:layer\:kalbio/" data-science-conf.yml
+          echo "setting layer version to kalbio:${{ needs.build-and-deploy.outputs.VERSION }}"
+          sed -i "s/kalbio\:[[:digit:]]\+/kalbio\:${{ needs.build-and-deploy.outputs.VERSION }}/g" data-science-conf.yml
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git add data-science-conf.yml
+          git diff --staged --quiet || git commit -m "bump kalbio layer version to ${{ needs.build-and-deploy.outputs.VERSION }} and account to ${{ env.AWS_ACCOUNT }}"
+          git push origin ${{ env.STACK_VERSION }}
