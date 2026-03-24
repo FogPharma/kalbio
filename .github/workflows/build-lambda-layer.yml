@@ -89,20 +89,20 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ inputs.aws_region }}
 
-      # Python 3.11 matches Lambda runtime; setup-python works on both GitHub and CodeBuild runners.
+      # Python 3.12 matches Lambda runtime; setup-python works on both GitHub and CodeBuild runners.
       - name: Install Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       # Install kalbio into Lambda layer layout; strip boto/urllib3 (provided by Lambda); remove tests and __pycache__; zip.
       - name: Build Lambda Layer
         run: |
-          mkdir -p aws-layer/python/lib/python3.11/site-packages
-          python -m pip install . -q --upgrade --target aws-layer/python/lib/python3.11/site-packages/ --platform manylinux2014_x86_64 --implementation cp --python-version 3.11
+          mkdir -p aws-layer/python/lib/python3.12/site-packages
+          python -m pip install . -q --upgrade --target aws-layer/python/lib/python3.12/site-packages/ --platform manylinux2014_x86_64 --implementation cp --python-version 3.12
           cd aws-layer
-          rm -rf python/lib/python3.11/site-packages/boto*
-          rm -rf python/lib/python3.11/site-packages/urllib3*
+          rm -rf python/lib/python3.12/site-packages/boto*
+          rm -rf python/lib/python3.12/site-packages/urllib3*
           find . -type d -name "__pycache__" | xargs rm -rf
           find . -type d -name "test*" | xargs rm -rf
           zip -q -r9 lambda-layer.zip .
@@ -113,7 +113,7 @@ jobs:
         id: deploy
         run: |
           cd aws-layer
-          PUBLISH=$(aws lambda publish-layer-version --layer-name ${{ env.LAYER_NAME }} --zip-file fileb://lambda-layer.zip --compatible-runtimes python3.11 --region ${{ env.AWS_REGION }})
+          PUBLISH=$(aws lambda publish-layer-version --layer-name ${{ env.LAYER_NAME }} --zip-file fileb://lambda-layer.zip --compatible-runtimes python3.12 --region ${{ env.AWS_REGION }})
           VERSION=$(echo $PUBLISH|jq -r .Version)
           if [ -n "${{ inputs.organization_id }}" ]; then
             aws lambda add-layer-version-permission --layer-name ${{ env.LAYER_NAME }} --version-number ${VERSION} --statement-id allOrganizationAccounts --principal "*" --organization-id ${{ inputs.organization_id }} --action lambda:GetLayerVersion --region ${{ env.AWS_REGION }}
