@@ -30,7 +30,9 @@ import json
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import List, Optional, TypedDict, Unpack
+from typing import List, Optional, TypedDict
+
+from typing_extensions import Unpack
 from kalbio._kaleidoscope_model import _KaleidoscopeBaseModel
 from kalbio.client import KaleidoscopeClient
 from pydantic import TypeAdapter

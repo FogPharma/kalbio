@@ -65,8 +65,9 @@ from typing import (
     TypeAlias,
     TypedDict,
     Union,
-    Unpack,
 )
+
+from typing_extensions import Unpack
 
 if TYPE_CHECKING:
     from kalbio.activities import Activity, ActivityIdentifier
