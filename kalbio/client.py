@@ -367,6 +367,60 @@ class KaleidoscopeClient:
         except JSONDecodeError:
             return None
 
+    def post_operation_callback(
+        self, operation_id: str, payload: Dict[str, Any], *, timeout: int = 30
+    ) -> Dict[str, Any]:
+        """POST an async operation completion payload to Kaleidoscope.
+
+        Calls ``POST /operations/{operation_id}/callback`` relative to the API base URL.
+
+        Args:
+            operation_id: Kaleidoscope operation identifier (from the inbound request).
+            payload: JSON-serializable completion body.
+            timeout: Request timeout in seconds (defaults higher than ``TIMEOUT_MAXIMUM``
+                for potentially large callback payloads).
+
+        Returns:
+            Dict with ``ok`` (whether HTTP status was 2xx), ``status_code`` (or None if
+            the request failed before a response), ``response`` (decoded JSON, raw text,
+            or None), and ``error`` (set only on transport failure).
+        """
+        path = f"/operations/{operation_id}/callback"
+        try:
+            resp = requests.post(
+                self._api_url + path,
+                data=json.dumps(payload),
+                headers=self._get_headers(),
+                timeout=timeout,
+                verify=self._verify_ssl,
+            )
+        except requests.RequestException as exc:
+            return {
+                "ok": False,
+                "status_code": None,
+                "response": None,
+                "error": str(exc),
+            }
+
+        text = resp.text if resp.text else ""
+        parsed: Any = None
+        if text:
+            try:
+                parsed = resp.json()
+            except JSONDecodeError:
+                parsed = text
+
+        ok = 200 <= resp.status_code < 300
+        if not ok:
+            print(f"POST {path} received {resp.status_code}: ", resp.content)
+
+        return {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "response": parsed,
+            "error": None,
+        }
+
     def _post_file(
         self, url: str, file_data: tuple[str, BinaryIO, str], body: Any = None
     ) -> Any:
