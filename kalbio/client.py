@@ -32,6 +32,8 @@ Example:
     ```
 """
 
+from __future__ import annotations
+
 import os
 from datetime import datetime, timedelta
 import json
@@ -183,12 +185,14 @@ class KaleidoscopeClient:
         from kalbio.entity_fields import EntityFieldsService
         from kalbio.entity_types import EntityTypesService
         from kalbio.exports import ExportsService
+        from kalbio.files import FilesService
         from kalbio.imports import ImportsService
         from kalbio.labels import LabelsService
         from kalbio.programs import ProgramsService
         from kalbio.property_fields import PropertyFieldsService
         from kalbio.record_views import RecordViewsService
         from kalbio.records import RecordsService
+        from kalbio.registration import RegistrationService
         from kalbio.workspace import WorkspaceService
 
         self._api_url = url
@@ -198,12 +202,14 @@ class KaleidoscopeClient:
         self.entity_fields = EntityFieldsService(self)
         self.entity_types = EntityTypesService(self)
         self.exports = ExportsService(self)
+        self.files = FilesService(self)
         self.imports = ImportsService(self)
         self.labels = LabelsService(self)
         self.property_fields = PropertyFieldsService(self)
         self.programs = ProgramsService(self)
         self.record_views = RecordViewsService(self)
         self.records = RecordsService(self)
+        self.registration = RegistrationService(self)
         self.workspace = WorkspaceService(self)
 
         self._client_id = client_id
@@ -366,6 +372,33 @@ class KaleidoscopeClient:
             return resp.json()
         except JSONDecodeError:
             return None
+
+    def _post_no_content(self, url: str, payload: dict) -> bool:
+        """Send a POST request expecting a 204 No Content response.
+
+        Args:
+            url (str): The endpoint URL (relative to the API base URL).
+            payload (dict): The data to be sent in the body of the POST request.
+                Should be serializable to JSON.
+
+        Returns:
+            bool: True if the request succeeded (status < 400), False otherwise.
+
+        Raises:
+            Exception: Any exception that may be raised by ``requests.post``
+        """
+
+        resp = requests.post(
+            self._api_url + url,
+            data=json.dumps(payload),
+            headers=self._get_headers(),
+            timeout=TIMEOUT_MAXIMUM,
+            verify=self._verify_ssl,
+        )
+        if resp.status_code >= 400:
+            print(f"POST {url} received {resp.status_code}: ", resp.content)
+            return False
+        return True
 
     def post_operation_callback(
         self, operation_id: str, payload: Dict[str, Any], *, timeout: int = 30
